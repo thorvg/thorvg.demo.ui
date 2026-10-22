@@ -1,0 +1,54 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>ThorUI · WebGL2 Demo</title>
+<style>
+html,body{margin:0;width:100%;height:100%;overflow:hidden;background:#f6f7f9;font-family:system-ui,sans-serif}
+canvas{display:block;width:100%;height:100%;outline:none;touch-action:none}
+#status{position:fixed;inset:0;display:grid;place-content:center;text-align:center;background:#f6f7f9;color:#263245;padding:24px;z-index:1}
+#status[hidden]{display:none}h1{font-size:24px;margin:0 0 12px}p{margin:0;white-space:pre-wrap}
+</style>
+</head>
+<body>
+<div id="status" role="status"><h1>ThorUI</h1><p id="message">Loading WebGL2 demo…</p></div>
+<canvas id="canvas" tabindex="0" aria-label="Interactive ThorUI demo"></canvas>
+<script>
+const canvas = document.getElementById('canvas');
+const status = document.getElementById('status');
+const message = document.getElementById('message');
+function fail(text) { status.hidden = false; message.textContent = text; }
+canvas.addEventListener('contextmenu', event => event.preventDefault());
+canvas.addEventListener('pointerdown', () => canvas.focus());
+canvas.addEventListener('webglcontextlost', event => {
+  event.preventDefault(); fail('Graphics context lost. Reload to restart the demo.');
+});
+window.addEventListener('error', event => fail(event.message || 'Unable to load the demo.'));
+window.addEventListener('unhandledrejection', event => fail(String(event.reason)));
+var Module = {
+  canvas,
+  arguments: ['-e', 'gl', '--fps'],
+  print: console.log,
+  printErr: text => { console.error(text); },
+  onAbort: reason => fail('Unable to start the demo: ' + reason),
+  onExit: code => fail(code ? 'Demo exited with code ' + code : 'Demo stopped. Reload to restart.'),
+  onDemoReady: () => { status.hidden = true; canvas.focus(); },
+};
+// Check support before the C++ entry point creates its SDL WebGL2 context.
+Module.preRun = [() => {
+  const probe = document.createElement('canvas');
+  const context = probe.getContext('webgl2');
+  if (!context) { fail('This demo requires WebGL2. Enable hardware acceleration and reload.'); throw new Error('WebGL2 unavailable'); }
+  context.getExtension('WEBGL_lose_context')?.loseContext();
+}];
+if (location.protocol === 'file:') fail('Serve this folder over HTTP. See web/README.md.');
+else {
+  const script = document.createElement('script');
+  script.src = 'demo.js';
+  script.onerror = () => fail('Unable to load demo.js. Build the demo first.');
+  document.body.append(script);
+}
+</script>
+</body>
+</html>
