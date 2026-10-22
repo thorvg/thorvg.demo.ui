@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
-"""Build the existing C++ demo and its dependencies for WebGL2."""
+"""Build the existing C++ demo and its dependencies for WebGPU."""
 import argparse
-import gzip
 import os
 from pathlib import Path
 import shutil
@@ -19,13 +18,15 @@ a = p.parse_args()
 a.thorvg = a.thorvg.resolve()
 a.toolkit = a.toolkit.resolve()
 a.sdl = a.sdl.resolve()
-build = root / '.web-build'
-build.mkdir(exist_ok=True)
+build = root / '.web-build/wg'
+output_name = 'demo'
+port_flags = ['--use-port=emdawnwebgpu']
+build.mkdir(parents=True, exist_ok=True)
 sdk = a.emsdk.resolve()
 em = sdk / 'upstream/emscripten'
 env = os.environ.copy()
 env['PATH'] = str(em) + os.pathsep + env['PATH']
-env['EM_CACHE'] = str(build / 'cache')
+env['EM_CACHE'] = str(root / '.web-build/cache')
 config = build / 'emscripten-config'
 config.write_text(f"LLVM_ROOT = {str(sdk / 'upstream/bin')!r}\nBINARYEN_ROOT = {str(sdk / 'upstream')!r}\nNODE_JS = {str(next((sdk / 'node').glob('*/bin/node')))!r}\n")
 env['EM_CONFIG'] = str(config)
@@ -48,9 +49,10 @@ needs_exe_wrapper = true
 """)
 meson_options = [
     '--default-library=static', '-Dbuildtype=release', '-Doptimization=s',
-    '-Db_lto=true', '-Db_ndebug=true', '-Dpartial=false', '-Dengines=gl', '-Dloaders=ttf',
-    '-Dsavers=', '-Dthreads=false', '-Dsimd=false', '-Dextra=opengl_es', '-Dtests=false',
+    '-Db_lto=true', '-Db_ndebug=true', '-Dpartial=false', '-Dengines=wg', '-Dloaders=ttf',
+    '-Dsavers=', '-Dthreads=false', '-Dsimd=false', '-Dextra=', '-Dtests=false',
 ]
+cross.write_text(cross.read_text() + "\n[built-in options]\ncpp_args = ['--use-port=emdawnwebgpu']\n")
 if (build / 'thorvg/build.ninja').exists():
     run('meson', 'configure', build / 'thorvg', *meson_options)
 else:
@@ -113,19 +115,41 @@ void Window::frame()
     {''')
 s = replace(s, '(ctime - ptime)', '(ctime - previousTime)')
 s = replace(s, 'ptime = ctime;', 'previousTime = ctime;')
-s = replace(s, 'SDL_GL_SetSwapInterval(0);', '(void)0;')
 s = replace(s, 'if (fullscreen) flags |= SDL_WINDOW_FULLSCREEN;', '(void)fullscreen;')
-# App layout and SDL input remain in CSS pixels. Only the GL target is physical.
+# App layout and SDL input remain in CSS pixels. Only the GPU target is physical.
 s = replace(s, 'flags | SDL_WINDOW_HIDDEN | SDL_WINDOW_RESIZABLE',
     'flags | SDL_WINDOW_HIDDEN | SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY')
 s = replace(s, 'SDL_GetWindowSizeInPixels(window, &w, &h)', 'SDL_GetWindowSize(window, &w, &h)')
 s = replace(s, '    // set the canvas target and draw on it.',
     '    int pixelWidth, pixelHeight;\n    SDL_GetWindowSizeInPixels(window, &pixelWidth, &pixelHeight);')
-s = replace(s, 'context, 0, size.w, size.h,', 'context, 0, pixelWidth, pixelHeight,')
 s = replace(s, 'event.button.x, event.button.y);', 'event.motion.x, event.motion.y);')
-s = replace(s, 'auto display = SDL_EGL_GetCurrentDisplay();', 'void* display = nullptr;')
-s = replace(s, 'auto surface = display ? SDL_EGL_GetWindowSurface(window) : nullptr;', 'void* surface = nullptr;')
-s = replace(s, 'target(display, surface, context,', 'target(display, surface, reinterpret_cast<void*>(static_cast<intptr_t>(emscripten_webgl_get_current_context())),')
+start = s.index('    // init WebGPU', s.index('WgWindow::WgWindow'))
+end = s.index('    // create a Canvas', start)
+s = s[:start] + '''    // Device creation is asynchronous in the browser; index.html prepares it
+    // before starting main(), so no Asyncify or synchronous waiting is needed.
+    instance = wgpuCreateInstance(nullptr);
+    device = emscripten_webgpu_get_device();
+    if (!instance || !device) return;
+    WGPUEmscriptenSurfaceSourceCanvasHTMLSelector selector{};
+    selector.chain.sType = WGPUSType_EmscriptenSurfaceSourceCanvasHTMLSelector;
+    selector.selector = {"#canvas", WGPU_STRLEN};
+    WGPUSurfaceDescriptor descriptor{};
+    descriptor.nextInChain = &selector.chain;
+    surface = wgpuInstanceCreateSurface(instance, &descriptor);
+    if (!surface) return;
+
+''' + s[end:]
+s = replace(s, 'surface, size.w, size.h, tvg::ColorSpace::XBGR8888',
+    'surface, pixelWidth, pixelHeight, tvg::ColorSpace::XBGR8888')
+s = replace(s, '    wgpuSurfacePresent(surface);', '    // Browser presents automatically after the frame callback.')
+gl_start = s.index('GlWindow::GlWindow(')
+gl_end = s.index('#ifdef TVG_WGPU_SUPPORTED', gl_start)
+s = s[:gl_start] + s[gl_end:]
+platform = toolkit / 'tvgToolkit.cpp'
+platform_source = platform.read_text()
+start = platform_source.index('        case RenderEngine::GL:')
+end = platform_source.index('        case RenderEngine::WEBGPU:', start)
+platform.write_text(platform_source[:start] + platform_source[end:])
 window.write_text(s)
 
 # Scale completed root paints once per scene rebuild. This includes overlays,
@@ -158,7 +182,7 @@ main.write_text(source)
 # demo sources. Original assets remain untouched; subset output is build-only.
 fonts = root / 'assets'
 if not a.full_fonts:
-    sys.path.insert(0, str(build / 'python'))
+    sys.path.insert(0, str(root / '.web-build/python'))
     try:
         from fontTools import subset
     except ImportError:
@@ -179,7 +203,8 @@ if not a.full_fonts:
         subsetter.subset(font)
         subset.save_font(font, str(fonts / name), options)
 
-run(em / 'em++', '-std=c++17', '-Oz', '-flto', '-DNDEBUG', '-DTVG_TOOLKIT_STATIC', '-DTVG_GLES_SUPPORTED',
+run(em / 'em++', '-std=c++17', '-Oz', '-flto', '-DNDEBUG', '-DTVG_TOOLKIT_STATIC', '-DTVG_WGPU_SUPPORTED',
+    *port_flags,
     '-DDEMO_FONT_PATH="/assets/DejaVuSans.ttf"', '-DDEMO_BOLD_FONT_PATH="/assets/DejaVuSans-Bold.ttf"',
     '-I' + str(root / 'src'), '-I' + str(a.thorvg / 'inc'), '-I' + str(a.toolkit / 'inc'),
     '-I' + str(a.sdl / 'include'), '-I' + str(build / 'sdl/include'),
@@ -187,14 +212,7 @@ run(em / 'em++', '-std=c++17', '-Oz', '-flto', '-DNDEBUG', '-DTVG_TOOLKIT_STATIC
     build / 'thorvg/src/libthorvg-1.a', build / 'sdl/libSDL3.a',
     '--js-library', root / 'web/pixel-ratio.js',
     '-sASYNCIFY=0', '-sALLOW_MEMORY_GROWTH=1', '-sINITIAL_MEMORY=67108864',
-    '-sMIN_WEBGL_VERSION=2', '-sMAX_WEBGL_VERSION=2', '-sENVIRONMENT=web',
+    '-sENVIRONMENT=web',
     '-sASSERTIONS=0', '-sEXIT_RUNTIME=1', '--embed-file', str(fonts) + '@/assets',
-    '-o', root / 'web/demo.js')
-licenses = []
-for label, path in [('ThorVG', a.thorvg / 'LICENSE'), ('ThorVG Toolkit', a.toolkit / 'LICENSE'), ('SDL3', a.sdl / 'LICENSE.txt'), ('DejaVu fonts', root / 'assets/DejaVuSans.LICENSE')]:
-    licenses.append(label + '\n' + '=' * len(label) + '\n' + path.read_text())
-(root / 'web/THIRD_PARTY_LICENSES.txt').write_text('\n\n'.join(licenses))
-for name in ('demo.js', 'demo.wasm'):
-    output = root / 'web' / name
-    output.with_suffix(output.suffix + '.gz').write_bytes(gzip.compress(output.read_bytes(), compresslevel=9, mtime=0))
-print('Built web/demo.js, web/demo.wasm, and optional gzip sidecars; serve web/ over HTTP.')
+    '-o', root / ('web/' + output_name + '.js'))
+print(f'Built web/{output_name}.js and web/{output_name}.wasm; serve web/ over HTTP.')
