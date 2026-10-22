@@ -77,7 +77,7 @@ s = window.read_text()
 s = replace(s, '#include <cassert>', '#include <cassert>\n#include <emscripten.h>\n#include <emscripten/html5.h>')
 header = toolkit / 'tvgWindow.h'
 header.write_text(replace(header.read_text(), '    void show();',
-    '    void show();\n    void frame();\n    uint64_t previousTime = 0;'))
+    '    void show();\n    void frame();\n    uint64_t previousTime = 0;\n    double pixelRatio = 0;'))
 s = replace(s, '    // Mainloop\n    SDL_Event event;\n\n    auto ptime = SDL_GetTicks();\n\n    while (running) {', '''    EM_ASM({ if (Module.onDemoReady) Module.onDemoReady(); });
     previousTime = SDL_GetTicks();
     // The browser owns scheduling. simulate_infinite_loop keeps run() from
@@ -101,17 +101,59 @@ void Window::frame()
     SDL_Event event;
     int w = EM_ASM_INT({ return Math.max(1, Math.round(innerWidth)); });
     int h = EM_ASM_INT({ return Math.max(1, Math.round(innerHeight)); });
+    const double dpr = emscripten_get_device_pixel_ratio();
+    if (dpr != pixelRatio) {
+        pixelRatio = dpr;
+        // SDL refreshes its backing-buffer ratio in its browser resize handler.
+        // Polling also catches DPR changes without a CSS viewport resize.
+        EM_ASM({ window.dispatchEvent(new Event('resize')); });
+        needResize = needDraw = true;
+    }
     if (w != int(size.w) || h != int(size.h)) SDL_SetWindowSize(window, w, h);
     {''')
 s = replace(s, '(ctime - ptime)', '(ctime - previousTime)')
 s = replace(s, 'ptime = ctime;', 'previousTime = ctime;')
 s = replace(s, 'SDL_GL_SetSwapInterval(0);', '(void)0;')
 s = replace(s, 'if (fullscreen) flags |= SDL_WINDOW_FULLSCREEN;', '(void)fullscreen;')
+# App layout and SDL input remain in CSS pixels. Only the GL target is physical.
+s = replace(s, 'flags | SDL_WINDOW_HIDDEN | SDL_WINDOW_RESIZABLE',
+    'flags | SDL_WINDOW_HIDDEN | SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY')
+s = replace(s, 'SDL_GetWindowSizeInPixels(window, &w, &h)', 'SDL_GetWindowSize(window, &w, &h)')
+s = replace(s, '    // set the canvas target and draw on it.',
+    '    int pixelWidth, pixelHeight;\n    SDL_GetWindowSizeInPixels(window, &pixelWidth, &pixelHeight);')
+s = replace(s, 'context, 0, size.w, size.h,', 'context, 0, pixelWidth, pixelHeight,')
 s = replace(s, 'event.button.x, event.button.y);', 'event.motion.x, event.motion.y);')
 s = replace(s, 'auto display = SDL_EGL_GetCurrentDisplay();', 'void* display = nullptr;')
 s = replace(s, 'auto surface = display ? SDL_EGL_GetWindowSurface(window) : nullptr;', 'void* surface = nullptr;')
 s = replace(s, 'target(display, surface, context,', 'target(display, surface, reinterpret_cast<void*>(static_cast<intptr_t>(emscripten_webgl_get_current_context())),')
 window.write_text(s)
+
+# Scale completed root paints once per scene rebuild. This includes overlays,
+# clips and FPS labels without changing any widget's CSS layout/input contract.
+main = toolkit / 'main.cpp'
+source = (root / 'src/main.cpp').read_text()
+source = replace(source, '#include <thorvg_toolkit.h>',
+    '#include <thorvg_toolkit.h>\n#include <emscripten/html5.h>')
+source = replace(source, '    bool render(tvg::Canvas* canvas)\n    {', '''    bool render(tvg::Canvas* canvas)
+    {
+        if (!renderLogical(canvas)) return false;
+        int pixelWidth, pixelHeight;
+        if (emscripten_get_canvas_element_size("#canvas", &pixelWidth, &pixelHeight) != EMSCRIPTEN_RESULT_SUCCESS) return false;
+        const float sx = float(pixelWidth) / viewport.w;
+        const float sy = float(pixelHeight) / viewport.h;
+        for (auto paint : canvas->paints()) {
+            auto matrix = paint->transform();
+            matrix.e11 *= sx; matrix.e12 *= sx; matrix.e13 *= sx;
+            matrix.e21 *= sy; matrix.e22 *= sy; matrix.e23 *= sy;
+            if (paint->transform(matrix) != tvg::Result::Success) return false;
+        }
+        return true;
+    }
+
+    bool renderLogical(tvg::Canvas* canvas)
+    {''')
+main.write_text(source)
+
 # Preserve every printable input character and every character present in the
 # demo sources. Original assets remain untouched; subset output is build-only.
 fonts = root / 'assets'
@@ -139,10 +181,11 @@ if not a.full_fonts:
 
 run(em / 'em++', '-std=c++17', '-Oz', '-flto', '-DNDEBUG', '-DTVG_TOOLKIT_STATIC', '-DTVG_GLES_SUPPORTED',
     '-DDEMO_FONT_PATH="/assets/DejaVuSans.ttf"', '-DDEMO_BOLD_FONT_PATH="/assets/DejaVuSans-Bold.ttf"',
-    '-I' + str(a.thorvg / 'inc'), '-I' + str(a.toolkit / 'inc'),
+    '-I' + str(root / 'src'), '-I' + str(a.thorvg / 'inc'), '-I' + str(a.toolkit / 'inc'),
     '-I' + str(a.sdl / 'include'), '-I' + str(build / 'sdl/include'),
-    *sorted((root / 'src').glob('*.cpp')), toolkit / 'tvgToolkit.cpp', window,
+    *[path for path in sorted((root / 'src').glob('*.cpp')) if path.name != 'main.cpp'], main, toolkit / 'tvgToolkit.cpp', window,
     build / 'thorvg/src/libthorvg-1.a', build / 'sdl/libSDL3.a',
+    '--js-library', root / 'web/pixel-ratio.js',
     '-sASYNCIFY=0', '-sALLOW_MEMORY_GROWTH=1', '-sINITIAL_MEMORY=67108864',
     '-sMIN_WEBGL_VERSION=2', '-sMAX_WEBGL_VERSION=2', '-sENVIRONMENT=web',
     '-sASSERTIONS=0', '-sEXIT_RUNTIME=1', '--embed-file', str(fonts) + '@/assets',
